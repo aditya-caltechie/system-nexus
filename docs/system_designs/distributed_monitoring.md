@@ -18,7 +18,9 @@
 9. [API Design](#9-api-design)
 10. [Key Design Decisions](#10-key-design-decisions)
 11. [Scaling & Non-Functional Requirements](#11-scaling--non-functional-requirements)
-12. [Trade-offs & Alternatives](#12-trade-offs--alternatives)
+12. [Security](#12-security)
+13. [OpenTelemetry Pipeline](#13-opentelemetry-pipeline)
+14. [Trade-offs & Alternatives](#14-trade-offs--alternatives)
 
 ---
 
@@ -59,6 +61,7 @@ Design a **Distributed Monitoring and Alerting System** that:
 | NFR3 | **Reliability** | 99.99% alert delivery; no data loss for critical metrics |
 | NFR4 | **Availability** | 99.9% uptime for query and alerting paths |
 | NFR5 | **Cost Efficiency** | Downsample/archive old data; optimize storage per metric type |
+| NFR6 | **Security** | Encryption in transit (TLS/mTLS); RBAC on query and alert APIs |
 
 ---
 
@@ -572,9 +575,177 @@ POST /api/v1/alerts
 
 ---
 
-## 12. Trade-offs & Alternatives
+## 12. Security
 
-### 12.1 Alternative Architectures
+Security is critical for a monitoring system: metrics can expose infrastructure topology, traffic patterns, and PII. Unauthorized access to alerting can cause denial-of-service or false alarms.
+
+### 12.1 Encryption in Transit
+
+| Segment | Mechanism | Notes |
+|---------|-----------|-------|
+| **Service → Collector** | TLS 1.3 | Scrape over HTTPS; validate collector cert |
+| **Collector → Kafka** | TLS (SASL_SSL) | Kafka supports in-transit encryption |
+| **Kafka → Flink** | TLS | Consumer connections encrypted |
+| **Flink → TSDB** | TLS | Write path encrypted |
+| **Client → Query Service** | TLS | All API traffic over HTTPS |
+| **Query Service → TSDB** | TLS | Internal network encryption |
+
+**Principle:** Encrypt all cross-node communication. Internal mesh can use mutual TLS for stronger guarantees.
+
+### 12.2 Mutual TLS (mTLS)
+
+**What it is:** Both client and server present certificates; each authenticates the other.
+
+**Where to use:**
+
+| Component | mTLS? | Rationale |
+|-----------|-------|-----------|
+| **Collector ↔ Services** | Yes (Pull) | Collectors prove identity; services reject unknown scrapers |
+| **Collector ↔ Kafka** | Yes | Kafka supports `SSL.client.auth=required` |
+| **Flink ↔ Kafka** | Yes | Strong identity for consumer groups |
+| **Query Service ↔ TSDB** | Optional | Depends on network trust boundary |
+
+**Benefits:** Prevents impersonation, man-in-the-middle, and unauthorized metric injection.
+
+### 12.3 Service Mesh (Envoy / Istio)
+
+**Role:** Envoy (or Istio/Linkerd) can provide:
+
+- **Automatic mTLS** between pods without app changes
+- **Traffic policy** (retries, timeouts, circuit breaking)
+- **Observability** (metrics, traces) from the mesh itself
+
+**Architecture with Envoy:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  Service A (with Envoy sidecar)  ──mTLS──►  Collector (with Envoy sidecar)  │
+│  Service B (with Envoy sidecar)  ──mTLS──►  Collector (with Envoy sidecar)  │
+│  Service C (with Envoy sidecar)  ──mTLS──►  Collector (with Envoy sidecar)  │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**When to use:**
+
+- **Use Envoy/mesh** when you already run Istio/Linkerd; get mTLS and policy for free.
+- **Skip mesh** when you have a simpler deployment (VMs, bare metal) or want to avoid sidecar overhead.
+
+**Trade-off:** Sidecar adds latency and resource usage; evaluate for high-cardinality scrape paths.
+
+### 12.4 Authentication & Authorization
+
+| Layer | Auth | Authz |
+|-------|------|-------|
+| **Scrape (Pull)** | mTLS or pre-shared token in HTTP header | Allowlist of collector identities |
+| **Push endpoint** | API key, JWT, or mTLS | Per-tenant or per-service write scope |
+| **Query API** | OAuth2, API key, SSO | RBAC: who can query which metrics/labels |
+| **Alert rules** | Same as Query API | Restrict who creates/modifies rules |
+| **Kafka** | SASL/SCRAM or mTLS | ACLs per topic/consumer group |
+
+**Sensitive metrics:** Redact or restrict labels (e.g., `user_id`, `email`) in query layer; apply PII policies at ingestion.
+
+### 12.5 Secrets & Credentials
+
+- **Vault / AWS Secrets Manager** for API keys, Kafka credentials, DB passwords
+- **Short-lived certs** for mTLS (e.g., cert-manager + Vault PKI)
+- **No secrets in config files** — inject at runtime
+
+### 12.6 Security Checklist
+
+- [ ] TLS everywhere (no plaintext)
+- [ ] mTLS for collector ↔ services and Kafka
+- [ ] RBAC on Query API and alert management
+- [ ] PII handling policy for metric labels
+- [ ] Audit logging for config changes and alert rule modifications
+
+---
+
+## 13. OpenTelemetry Pipeline
+
+**OpenTelemetry (OTel)** is a vendor-neutral standard for traces, metrics, and logs. The question: *Do we need an OTel pipeline in addition to (or instead of) our custom metrics design?*
+
+### 13.1 What OpenTelemetry Provides
+
+| Signal | OTel Role |
+|--------|-----------|
+| **Metrics** | SDK, semantic conventions, exporter interface |
+| **Traces** | Distributed tracing (spans, context propagation) |
+| **Logs** | Structured log model |
+
+**OTel Collector** can receive, process, and export telemetry to backends (Prometheus, Jaeger, Kafka, etc.).
+
+### 13.2 Do We Need OTel?
+
+| Scenario | Use OTel? | Reason |
+|----------|-----------|--------|
+| **Metrics only, Prometheus-style** | Optional | Prometheus + exporters work well; OTel adds flexibility |
+| **Metrics + Traces** | **Yes** | OTel unifies signals; correlation (trace ID in metrics) |
+| **Multi-vendor / multi-backend** | **Yes** | Avoid lock-in; switch backends without code changes |
+| **Greenfield, cloud-native** | **Yes** | OTel is the industry direction |
+| **Legacy, Prometheus entrenched** | Gradual | Add OTel Collector as gateway; migrate incrementally |
+
+### 13.3 Architecture: OTel Collector in the Pipeline
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│  Services (OTel SDK)  ──OTLP (gRPC/HTTP)──►  OTel Collector  ──►  Kafka / TSDB  │
+│  OR: Prometheus scrape ──────────────────►  OTel Collector  ──►  Kafka / TSDB  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**OTel Collector can:**
+
+- **Receive** OTLP, Prometheus scrape, StatsD, Jaeger, etc.
+- **Transform** (filter, rename, add attributes)
+- **Export** to Kafka, Prometheus, InfluxDB, etc.
+
+**Placement options:**
+
+| Option | Pros | Cons |
+|--------|------|------|
+| **OTel Collector instead of custom Collectors** | Single pipeline, vendor-neutral | May need custom processors |
+| **OTel Collector in front of Kafka** | Standardizes format; supports multiple receivers | Extra hop |
+| **OTel Collector as sidecar** | Per-pod isolation | Resource overhead |
+
+### 13.4 When to Use OTel Pipeline
+
+**Use OTel when:**
+
+- You need **traces + metrics** and want correlation.
+- You want **vendor neutrality** (avoid lock-in to Prometheus/Datadog).
+- You have **heterogeneous sources** (Prometheus, StatsD, Jaeger, custom).
+- You're building **new services** and can adopt OTel SDK.
+
+**Stick with custom (Prometheus + Kafka + Flink) when:**
+
+- You're **metrics-only** and Prometheus fits.
+- You have **heavy custom processing** (Flink jobs) that OTel processors can't replace.
+- **Operational simplicity** is paramount and OTel adds unneeded complexity.
+
+### 13.5 Hybrid Approach
+
+A practical setup:
+
+1. **OTel Collector** as the ingestion gateway (receives OTLP, Prometheus scrape, StatsD).
+2. **Kafka** as the buffer (OTel exports to Kafka).
+3. **Flink/Spark** for aggregation and downsampling (unchanged).
+4. **TSDB** for storage (Prometheus, VictoriaMetrics, etc.).
+
+This gives you OTel’s flexibility at the edge while keeping your existing processing and storage.
+
+### 13.6 Summary
+
+| Question | Answer |
+|----------|--------|
+| **Do we need OTel?** | Not strictly — a custom pipeline works. But for traces + metrics, multi-vendor, or greenfield, OTel is recommended. |
+| **OTel vs custom Collectors?** | OTel Collector can replace or sit alongside custom collectors; it standardizes ingestion. |
+| **OTel vs Prometheus?** | OTel is a standard; Prometheus is a product. Use OTel SDK/Collector with Prometheus as a backend. |
+
+---
+
+## 14. Trade-offs & Alternatives
+
+### 14.1 Alternative Architectures
 
 | Approach | Pros | Cons |
 |----------|------|------|
@@ -583,7 +754,7 @@ POST /api/v1/alerts
 | **Datadog / New Relic** | Managed, full-featured | Cost, vendor lock-in |
 | **OpenTelemetry + Collector** | Vendor-neutral, traces + metrics | Newer, less mature |
 
-### 12.2 Storage Alternatives
+### 14.2 Storage Alternatives
 
 | Option | Use Case |
 |--------|----------|
@@ -592,7 +763,7 @@ POST /api/v1/alerts
 | **TimescaleDB** | SQL-friendly, PostgreSQL-based |
 | **ClickHouse** | Analytics, ad-hoc queries |
 
-### 12.3 Summary
+### 14.3 Summary
 
 This design prioritizes:
 
@@ -613,6 +784,8 @@ Trade-offs include operational complexity (Kafka, Flink) and the choice of Pull 
 - [ ] Deep dive: Kafka topics/partitions
 - [ ] Deep dive: Push vs Pull
 - [ ] Discuss scaling and fault tolerance
+- [ ] Discuss security (mTLS, Envoy, auth)
+- [ ] Discuss OpenTelemetry vs custom pipeline
 - [ ] Discuss trade-offs and alternatives
 
 ---
