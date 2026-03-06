@@ -36,6 +36,28 @@ Design a **Distributed Monitoring and Alerting System** that:
 
 **Reference Diagram:** See [Overall System Design](#51-overall-system-design) for the hand-drawn architecture diagram.
 
+### 1.1 Interview Narrative (what I would say)
+
+In a real interview, I’d frame this as **two critical paths**:
+
+- **Write path (telemetry ingestion)**: services expose/emit metrics → collectors normalize and batch → Kafka buffers bursts and decouples producers/consumers → stream processing builds rollups/downsamples → TSDB stores hot + warm + cold tiers.
+- **Read/decision path (query + alerting)**: dashboards and alert rules query through a stateless query layer + cache → alerting evaluates rules on a schedule, dedupes/groups, and routes notifications with retries and escalation.
+
+Then I call out the **big risks** (this is where senior engineers spend time):
+
+- **Cardinality explosion** from labels (can take down TSDB and queries)
+- **Backpressure** and burst handling across collectors/Kafka/processing/TSDB
+- **Correctness** (duplicates, late samples, clock skew, gaps)
+- **Alert quality** (noise, dedupe, “for” windows, escalation)
+- **Multi-tenancy + security** (RBAC, encryption, audit trail)
+
+### 1.2 Deep-dive pivots (when the interviewer asks “tell me more”)
+
+- **Collectors**: scrape scheduling/jitter, timeouts/concurrency, discovery/health
+- **Kafka**: partition key, ordering boundaries, consumer scaling
+- **TSDB**: sharding/indexing/compaction and query fan-out
+- **Alerting**: HA evaluation, dedupe, silences, notification reliability
+
 ---
 
 ## 2. Requirements
@@ -91,6 +113,17 @@ Design a **Distributed Monitoring and Alerting System** that:
 
 **Total:** ~450 TB (raw + compressed)
 
+### 3.3 Staff-level capacity gotchas (where systems fail)
+
+- **Cardinality dominates**: cost grows with the number of unique time series. Roughly:
+  \[
+  \text{series} \approx \sum_{\text{metric}} \prod_{\text{label}} |\text{values}|
+  \]
+  One high-cardinality label (e.g., `user_id`, `request_id`, `path`) can turn **1M series into 100M+**.
+- **Read load is spiky and fan-out**: dashboards trigger many range queries and can fan out across shards/blocks; plan for bursty query concurrency.
+- **Write amplification**: raw samples + index updates + rollups + compaction typically require **2–5×** raw ingest headroom.
+- **Correlated spikes**: deploys/incidents increase traffic and error rates → more metrics and more alert evaluations at the worst possible time.
+
 ---
 
 ## 4. Metric Data Model
@@ -120,7 +153,14 @@ Design a **Distributed Monitoring and Alerting System** that:
 | `timestamp` | int64 (ms) | Unix epoch when metric was recorded |
 | `value` | float64 | Numeric measurement |
 
-### 4.3 Metric Types
+### 4.3 Staff-level conventions (to avoid long-term pain)
+
+- **Names + units**: enforce conventions like `snake_case` and explicit units (`_seconds`, `_bytes`, `_total`) so queries and alerts are unambiguous.
+- **Label hygiene**: define allow/deny lists and per-metric label budgets; reject/strip high-cardinality labels at ingestion.
+- **Tenant isolation**: for a shared platform, treat `tenant_id` as first-class and enforce per-tenant quotas (ingest rate, series count, query cost).
+- **Exemplars (optional)**: attach trace IDs to some metric points to pivot from “latency spike” to “sample trace” quickly.
+
+### 4.4 Metric Types
 
 | Type | Example | Use Case |
 |------|---------|----------|
@@ -284,6 +324,16 @@ flowchart TB
 - Validate and normalize format
 - Batch and forward to Kafka
 
+**Operational details (what makes collectors robust):**
+
+- **Scrape jitter**: randomize scrape start times to avoid synchronized spikes (thundering herds).
+- **Timeouts + concurrency**: per-target timeouts (e.g., 3–5s) and global concurrency limits so collectors don’t overload the fleet.
+- **Retry policy**:
+  - Scrapes: minimal retries (retries can amplify load); prefer “try again next interval.”
+  - Kafka produce: retries with backoff and bounded queueing.
+- **Overload protection**: if Kafka is slow/unavailable, apply backpressure and drop low-priority metrics first (or spill to disk only with strict bounds).
+- **Clock skew**: pull path typically uses collector timestamps; push path must handle skew and clamp extreme timestamps.
+
 **Load Distribution:**
 
 - **Consistent Hashing:** Map each `(source_id, metric_name)` to a dedicated collector
@@ -312,6 +362,14 @@ flowchart TB
 - **By metric_name:** `hash(metric_name) % num_partitions` — co-locate same metric type
 - **By labels:** `hash(host, service) % num_partitions` — locality for same host
 
+**Staff-level note (ordering, keys, duplicates):**
+
+- Ordering is only guaranteed **within a partition**. If downstream rollups are per-series, key by a stable series identifier (e.g., `hash(tenant_id, metric_name, labels)`).
+- Most monitoring pipelines operate **at-least-once** (especially with Kafka + stream processing). Plan for duplicates and make ingestion tolerant:
+  - treat `(series_id, timestamp)` as idempotent where possible
+  - use last-write-wins semantics if duplicates occur
+- Avoid “exactly-once everywhere” as a default—it’s costly and rarely worth it for metrics (alerts should be robust to minor duplication).
+
 **Topic Layout:**
 
 ```
@@ -336,6 +394,12 @@ metrics.custom.*      (partition 0..N)
 ```
 Raw Metrics → Windowing (1m) → Aggregation (avg, sum, p99) → Write to TSDB
 ```
+
+**Correctness notes (common interviewer probes):**
+
+- **Late/out-of-order samples**: windowing needs a lateness policy (watermarks). Decide whether to update old rollups, emit corrections, or drop late data.
+- **Reprocessing on failure**: checkpointed processors often replay Kafka offsets after restart → duplicates are expected.
+- **Downsampling**: retain raw at high resolution briefly; store rollups for longer retention; ensure queries automatically pick the right resolution to control cost.
 
 ### 6.5 Time Series Database
 
@@ -381,6 +445,49 @@ sequenceDiagram
     F->>T: Write
 ```
 
+### 7.1.1 Staff-level walkthrough: Pull ingestion (scrape) end-to-end
+
+Use this as a **2–4 minute** explanation. Focus on *why each hop exists* and *what breaks under stress*.
+
+#### Step A — Service exposes metrics
+
+- **Mechanism**: service exports `/metrics` (Prometheus exposition) or uses an SDK that exposes counters/gauges/histograms from memory.
+- **Why it’s safe**: service does not need Kafka credentials or network egress to Kafka; it just serves HTTP.
+- **Failure mode**: if `/metrics` is slow, it can consume CPU or block request threads.
+  - **Mitigation**: dedicated metrics handler thread pool, timeouts, avoid expensive label generation at scrape time.
+
+#### Step B — Discovery decides *what* to scrape
+
+- **Discovery source**: Zookeeper/etcd/Consul/K8s API provides the current list of targets (instances, ports, metadata).
+- **Key insight**: discovery is a **control plane**—treat it as eventually consistent. Collectors should tolerate target churn.
+
+#### Step C — Collector scrapes and normalizes
+
+- **Scrape policy**: jitter + concurrency limits + per-target timeout.
+- **Normalization**: enforce metric naming/units, label allowlist, tenant enrichment, and schema validation.
+- **Cardinality defense** (staff highlight): reject or strip labels that exceed per-metric budgets (e.g., `path`, `user_id`).
+
+#### Step D — Collector produces to Kafka (buffer + decouple)
+
+- **Why Kafka**: absorbs bursts, isolates TSDB from source-side spikes, allows replays/backfills, enables parallel processing.
+- **Partition key**: key by stable `series_id = hash(tenant, metric_name, labels)` so samples for a series stay ordered.
+- **Reliability**: `acks=all`, replication=3, bounded retry with backoff. If Kafka is down, apply backpressure and drop low-priority.
+
+#### Step E — Stream processing builds rollups
+
+- **Windowing**: 15s raw → 1m rollup for warm → 5m rollup for cold.
+- **Correctness**: handle out-of-order samples using watermarks; accept at-least-once and tolerate duplicates.
+
+#### Step F — TSDB write + compaction
+
+- **Write path**: WAL + head block + periodic flush → immutable blocks → background compaction.
+- **Operational reality**: compaction and index updates are where CPU/IO goes; plan capacity for **write amplification**.
+
+#### Step G — “Done” criteria (SLO/SLI)
+
+- **Ingest freshness**: \(p99\) time from scrape → queryable in TSDB (e.g., < 30s).
+- **Ingest success**: dropped samples rate, Kafka backlog (lag), TSDB write error rate.
+
 ### 7.2 Read Path (Query)
 
 ```mermaid
@@ -402,6 +509,40 @@ sequenceDiagram
     QS-->>Client: JSON response
 ```
 
+### 7.2.1 Staff-level walkthrough: Query execution (what actually happens)
+
+#### Step A — Client request classification
+
+- **Instant query**: “value at time \(t\)”
+- **Range query**: “values over \([t_0, t_1]\) at step \(s\)” (most dashboard traffic)
+
+Query service should parse the expression and enforce **cost controls**:
+
+- max time range, min step, max series returned, max label matchers
+- per-tenant query concurrency limits and rate limits
+
+#### Step B — Cache behavior (why it works and when it doesn’t)
+
+- Cache is effective for dashboards that refresh every 10–30s and many users viewing the same graphs.
+- Prefer caching **post-aggregation** results for common windows (e.g., last 5m/1h) rather than raw series.
+- Cache key must include tenant + query + time window + step; invalidate naturally via TTL.
+
+#### Step C — TSDB query fan-out + merge
+
+- Query frontend identifies matching series via the inverted index.
+- It fans out to the relevant shards/blocks for the requested time range and merges results.
+- **Staff insight**: most “slow queries” are caused by (a) high-cardinality matchers, (b) too-wide time ranges, or (c) unbounded group-bys.
+
+#### Step D — Response shaping
+
+- Downsample automatically based on time range (e.g., > 24h → serve 5m rollup).
+- Enforce result limits and return partials if needed (with clear warnings) rather than timing out silently.
+
+#### “Done” criteria (SLO/SLI)
+
+- \(p95/p99\) query latency by query type (instant vs range)
+- query error rate, timeouts, cache hit rate, and TSDB fan-out count
+
 ### 7.3 Alert Evaluation Path
 
 ```mermaid
@@ -422,6 +563,51 @@ sequenceDiagram
         end
     end
 ```
+
+### 7.3.1 Staff-level walkthrough: Alerting correctness and HA
+
+Alerting is a **decision system**, not just queries. A staff-level design emphasizes *correctness semantics* and *operational safety*.
+
+#### Step A — Rule model
+
+Typical rule has:
+
+- **expr**: query expression (e.g., error rate, latency p99)
+- **for**: how long condition must hold (reduces flapping)
+- **labels**: severity/team/tenant
+- **annotations**: runbook link, summary
+
+#### Step B — Evaluation scheduling
+
+- Evaluate every 30–60s; use jitter to avoid synchronized spikes.
+- Prefer **recording rules** (precompute expensive aggregations) for common alert inputs.
+
+#### Step C — HA model (don’t page twice)
+
+Two common patterns:
+
+- **Active/standby evaluator** with leader election (ZK/etcd). Only leader emits alerts.
+- **Active/active evaluators** but downstream Alert Manager performs strict dedupe using `(alertname, labels)` identity.
+
+#### Step D — Notification reliability
+
+- Alert Manager groups/dedupes, applies silences, then routes to channels.
+- Use retries with exponential backoff and provider-specific rate limits.
+- Multi-channel escalation for critical alerts (Slack → PagerDuty → phone) with acknowledgement tracking.
+
+#### Step E — “no missed critical alerts”
+
+You can never guarantee “no missed alerts” without trade-offs, but you can design for:
+
+- **durable inputs** (Kafka/TSDB) so evaluation can catch up after outages
+- **watchdog alerts** (alerting system health)
+- **end-to-end synthetic canaries** (“heartbeat metric must be present”)
+
+#### “Done” criteria (SLO/SLI)
+
+- time-to-detect (TTD): metric breach → alert fired
+- time-to-notify (TTN): alert fired → delivery acknowledged by provider
+- duplicate page rate and noise rate (pages per incident)
 
 ---
 
@@ -446,6 +632,14 @@ Table: metrics
 | Hot | 15 days | 15s | SSD |
 | Warm | 90 days | 1m | HDD |
 | Cold | 1 year | 5m | Object storage (S3) |
+
+### 8.3 TSDB internals (how it stays fast)
+
+- **Write path**: append-only ingestion into an in-memory “head” plus a WAL; periodically flush immutable blocks.
+- **Indexing**: inverted index over `(metric_name, label_key, label_value)` to resolve label matchers; this is why cardinality hurts.
+- **Compaction**: background merges smaller blocks into larger blocks to improve compression and query locality (at the cost of write amplification).
+- **Sharding + query fan-out**: shard by `(tenant_id, metric_name)` and/or time; queries fan out to relevant shards/blocks and merge results.
+- **Read caching**: cache recent blocks and index lookups; a query-frontend can also cache common dashboard queries.
 
 ---
 
@@ -522,6 +716,26 @@ POST /api/v1/alerts
 
 ## 11. Scaling & Non-Functional Requirements
 
+### 11.0 Staff-level SLOs/SLIs (what we actually measure)
+
+If you present this at Staff level, call out that the monitoring system itself must be observable with clear SLIs:
+
+| Area | SLI examples | Why it matters |
+|------|--------------|----------------|
+| **Ingestion freshness** | \(p90/p95/p99\) scrape-to-queryable latency | Alerting correctness depends on freshness |
+| **Data loss** | dropped samples %, Kafka lag, TSDB write error rate | Silent loss is worse than visible degradation |
+| **Query** | \(p90/p95/p99\) latency, timeout rate, cache hit rate | Dashboards must be trustworthy during incidents |
+| **Alerting** | TTD/TTN, duplicate pages %, noise rate | Goal is “actionable pages,” not just pages |
+| **Control plane** | discovery convergence time, config propagation time | Impacts scale-ups and deploy churn |
+
+**How to talk about percentiles (Staff-level framing):**
+
+- **p90**: “typical experience” — good for UX baselines and capacity planning; can hide long tails.
+- **p95**: “strong baseline” — common SLO percentile for user-facing queries and dashboards.
+- **p99**: “tail reliability” — use for paging paths (ingestion freshness, alert evaluation/query) because incidents often show up first in the tail.
+
+If the interviewer asks *why p99 matters*: at large scale, even a small tail means a lot of real requests/users affected, and tail latency correlates strongly with saturation and queueing.
+
 ### 11.1 Scalability
 
 | Component | Scaling Strategy |
@@ -554,7 +768,17 @@ POST /api/v1/alerts
 | **Alert deduplication** | Alert Manager groups and deduplicates |
 | **Alert retries** | Retry notification delivery (e.g., 3 retries) |
 
-### 11.4 Availability
+### 11.4 Backpressure & graceful degradation (the “incident” story)
+
+When a downstream dependency degrades (Kafka, processors, TSDB), a senior-level design explains how we **fail safely**:
+
+- **Protect services**: pull model keeps services passive; collectors absorb instability without forcing app changes.
+- **Protect collectors**: bounded queues, drop policies (drop low-priority first), and clear SLOs/alerts for collector health.
+- **Protect Kafka**: quotas per producer/tenant, monitor ISR/URPs, and avoid unbounded topic growth.
+- **Protect TSDB**: ingest rate limits, prioritize critical metrics, temporarily reduce scrape frequency, and shed expensive label sets.
+- **Protect query**: rate-limit expensive queries, cap max range/step, and cache/dedupe identical dashboard queries via a query frontend.
+
+### 11.5 Availability
 
 | Component | Strategy |
 |-----------|----------|
@@ -564,7 +788,7 @@ POST /api/v1/alerts
 | **TSDB** | Replication; read replicas |
 | **Query Service** | Multi-AZ deployment |
 
-### 11.5 Cost Efficiency
+### 11.6 Cost Efficiency
 
 | Technique | Benefit |
 |-----------|---------|
@@ -572,6 +796,28 @@ POST /api/v1/alerts
 | **Tiered retention** | Hot → Warm → Cold; cheaper storage for old data |
 | **Compression** | Gorilla, ZSTD in TSDB |
 | **Selective collection** | Drop low-value metrics |
+
+### 11.7 Multi-tenancy & quotas (staff-level requirement in practice)
+
+If this platform is shared across orgs/teams, multi-tenancy is not optional.
+
+**Isolation goals:**
+
+- One noisy tenant cannot starve others (write or read).
+- Clear per-tenant cost allocation (series count, bytes ingested, query CPU time).
+
+**Quotas to enforce:**
+
+- **Ingest**: max samples/sec, max burst, max unique series, max label keys/values per metric
+- **Query**: max range, min step, max series returned, max concurrent queries
+- **Alerting**: max rules, max evaluation cost, max notification rate
+
+**Enforcement points:**
+
+- Collectors (drop/strip early)
+- Kafka quotas/ACLs
+- Query service admission control
+- Alerting rule validation (cost estimation before accepting a rule)
 
 ---
 
@@ -606,6 +852,12 @@ Security is critical for a monitoring system: metrics can expose infrastructure 
 | **Query Service ↔ TSDB** | Optional | Depends on network trust boundary |
 
 **Benefits:** Prevents impersonation, man-in-the-middle, and unauthorized metric injection.
+
+**Identity & rotation (what “good” looks like):**
+
+- Prefer **workload identity** (e.g., SPIFFE/SPIRE, cloud workload identities) so certs map to services, not IPs.
+- Use **short-lived certs** with automatic rotation (hours/days), delivered via SDS (in Envoy/mesh) or a cert-manager/Vault PKI flow.
+- Make identity visible in logs/metrics so you can answer: “Which collector scraped this service?” during incidents.
 
 ### 12.3 Service Mesh (Envoy / Istio)
 
@@ -650,7 +902,13 @@ Security is critical for a monitoring system: metrics can expose infrastructure 
 - **Short-lived certs** for mTLS (e.g., cert-manager + Vault PKI)
 - **No secrets in config files** — inject at runtime
 
-### 12.6 Security Checklist
+### 12.6 Auditability (often overlooked)
+
+- Audit log **who** changed alert rules, silences, notification routing, and retention policies.
+- Treat alerting config as production code: **reviews**, **change history**, and **rollbacks**.
+- Alert on suspicious activity: spikes in rule changes, auth failures, and unusually expensive queries.
+
+### 12.7 Security Checklist
 
 - [ ] TLS everywhere (no plaintext)
 - [ ] mTLS for collector ↔ services and Kafka
