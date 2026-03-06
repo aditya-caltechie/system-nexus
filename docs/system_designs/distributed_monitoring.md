@@ -930,4 +930,8 @@ Trade-offs include operational complexity (Kafka, Flink) and the choice of Pull 
 
 ---
 
-*Document generated for FAANG-style system design interview preparation.*
+## Reference:
+https://leetcode.com/discuss/post/4190812/part-1-system-design-for-senior-engineer-ss9r/
+https://leetcode.com/discuss/post/5929296/part-2-system-design-interview-questions-lf2e/
+
+
